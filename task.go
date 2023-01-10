@@ -19,7 +19,7 @@ var (
 type TaskQueue interface {
 
 	// -
-	//	pull 从redis的list内拉取消息
+	//	Pull 从redis的list内拉取消息
 	//	加分布式锁
 	Pull()
 
@@ -27,18 +27,27 @@ type TaskQueue interface {
 	//	ack消费完每个节点自行获取下一次拉取的权限
 	//	锁释放
 	// Ack()
+
+	// -
+	//	Stop支持优雅退出
+	//	当主进程有退出信号后,可调用此方法暂停任务的拉取
+	Stop()
 }
 
 type taskQueue struct {
 	ctx context.Context
 
 	// -
-	//	queueC:协程
-	queueC map[uint32]chan struct{}
+	// //	queueC:任务队列所依赖的通信channle
+	// queueC map[uint32]chan struct{}
+
+	// // -
+	// //	queueT:任务队列的标识
+	// queueT map[uint32]bool
 
 	// -
 	//	queue:协程
-	queue map[string]uint32
+	queue map[string]*content
 
 	// -
 	//	ctl:redis客户端
@@ -47,6 +56,17 @@ type taskQueue struct {
 	// -
 	//	handle 处理函数
 	handle func(context.Context, string) error
+
+	// -
+	//	是否停止
+	ifStop bool
+}
+
+type content struct {
+	tag    uint32
+	signl  chan struct{}
+	ifNew  bool
+	tagMap map[uint32]struct{}
 }
 
 // -
@@ -72,19 +92,19 @@ func NewTaskQueue(ctx context.Context, ctl *redis.Client, handle func(context.Co
 		ctx:    ctx,
 		ctl:    ctl,
 		handle: handle,
-		queueC: make(map[uint32]chan struct{}, 1),
-		queue:  map[string]uint32{},
 	}
 
-	waitGoNum, err := tq.ctl.Keys(tq.ctx, util.Output(0, 0)).Result()
+	waitGoNum, err := tq.ctl.Keys(tq.ctx, util.Output()).Result()
 	if err != nil {
 		return nil, err
 	}
 
 	for i := 0; i < len(waitGoNum); i++ {
-		tag := tq.rand()
-		tq.queueC[tag] = make(chan struct{}, 1)
-		tq.queue[waitGoNum[i]] = tag
+		tq.queue[waitGoNum[i]] = &content{
+			signl: make(chan struct{}, 1),
+			ifNew: true,
+		}
+
 	}
 
 	go tq.watch()
@@ -101,10 +121,6 @@ func (tq *taskQueue) rand() uint32 {
 
 	tag := rand.Uint32()
 
-	if _, ok := tq.queueC[tag]; ok {
-		tq.rand()
-	}
-
 	return tag
 }
 
@@ -115,7 +131,11 @@ func (tq *taskQueue) watch() {
 
 	for range time.Tick(watchGap) {
 
-		waitGoNum, err := tq.ctl.Keys(tq.ctx, util.Output(0, 0)).Result()
+		if tq.ifStop {
+			continue
+		}
+
+		waitGoNum, err := tq.ctl.Keys(tq.ctx, util.Output()).Result()
 
 		if err != nil {
 			fmt.Println(err.Error())
@@ -134,17 +154,16 @@ func (tq *taskQueue) watch() {
 
 		for k, v := range tq.queue {
 
+			if v == nil {
+				continue
+			}
+
+			// 刷新旧任务队列标识值
+			tq.queue[k].ifNew = false
 			if _, ok := waitGoMap[k]; !ok {
-
-				if tq.queueC[v] != nil {
-					close(tq.queueC[v])
-				}
-
-				delete(tq.queueC, tq.queue[k])
+				close(tq.queue[k].signl)
 				delete(tq.queue, k)
-
 				ifRefresh = true
-
 			}
 
 		}
@@ -153,10 +172,10 @@ func (tq *taskQueue) watch() {
 
 			if _, ok := tq.queue[k]; !ok {
 
-				tag := tq.rand()
-
-				tq.queue[k] = tag
-				tq.queueC[tag] = make(chan struct{}, 1)
+				tq.queue[k] = &content{
+					ifNew: true,
+					signl: make(chan struct{}, 1),
+				}
 
 				ifRefresh = true
 			}
@@ -175,7 +194,11 @@ func (tq *taskQueue) Pull() {
 
 	for k, v := range tq.queue {
 
-		go func(key string, sign chan struct{}) {
+		if !v.ifNew {
+			continue
+		}
+
+		go func(key string, signal chan struct{}) {
 
 			var (
 				run  bool
@@ -187,20 +210,29 @@ func (tq *taskQueue) Pull() {
 				select {
 				case <-tick.C:
 
+					if tq.ifStop {
+						continue
+					}
+
 					task, err := tq.ctl.RPop(tq.ctx, key).Result()
 					if err != nil && err.Error() != "redis: nil" {
 						fmt.Println("get task error,detail", err.Error())
 					}
 
 					run = true
+
 					// handle task
-					err = tq.handle(tq.ctx, task)
-					if err != nil {
+					if tq.handle(tq.ctx, task) != nil {
 						fmt.Println("handle.task error,detail", err.Error())
 					}
+
+					if tq.ctl.LPush(tq.ctx, key, task).Err() != nil {
+						fmt.Println("handle.task.error,attempt.push.error:", err.Error(), "\ntask.content:", task)
+					}
+
 					run = false
 
-				case <-sign:
+				case <-signal:
 
 					start := time.Now()
 
@@ -217,8 +249,12 @@ func (tq *taskQueue) Pull() {
 
 			}
 
-		}(k, tq.queueC[v])
+		}(k, tq.queue[k].signl)
 
 	}
 
+}
+
+func (tq *taskQueue) Stop() {
+	tq.ifStop = true
 }

@@ -1,6 +1,6 @@
 package util
 
-import "fmt"
+import "strconv"
 
 // -
 //	taskQueueTag
@@ -9,7 +9,6 @@ var taskQueueTag = ""
 
 func SetTaskQueueTag(tag string) {
 	taskQueueTag = tag
-	// "mix:user:resource"
 }
 
 // Output
@@ -19,11 +18,12 @@ func Output(args ...int64) string {
 		return taskQueueTag + "*"
 	}
 
-	format := ""
-	for range args {
-		format += ":%d"
+	format := taskQueueTag
+
+	for _, v := range args {
+		format += ":" + strconv.FormatInt(v, 10)
 	}
 
-	return fmt.Sprintf(taskQueueTag+format, args)
+	return format
 
 }
